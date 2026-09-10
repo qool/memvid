@@ -162,3 +162,12 @@ harness = false
 name = "vec_search_benchmark"
 harness = false
 required-features = ["hnsw_bench"]
+
+# NDJSON stdio sidecar used by the arxcore-v2 PoC. Needs the `vec` feature to
+# compile (it links memvid_core::text_embed for hybrid lexical + semantic
+# search); at runtime it degrades to lexical-only if the embedding model file
+# is missing. Build with: cargo build --release --features vec --bin memvidd
+[[bin]]
+name = "memvidd"
+path = "src/bin/memvidd.rs"
+required-features = ["vec"]
