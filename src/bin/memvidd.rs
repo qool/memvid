@@ -19,6 +19,15 @@ use memvid_core::types::embedding::EmbeddingProvider;
 use memvid_core::{DocumentFormat, Memvid, PutOptions, ReaderHint, ReaderRegistry, SearchHit, SearchRequest};
 use serde_json::{Value, json};
 
+#[cfg(feature = "encryption")]
+use memvid_core::encryption::{self, EncryptionError};
+#[cfg(feature = "encryption")]
+use std::path::Path;
+#[cfg(feature = "encryption")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "encryption")]
+use zeroize::Zeroize;
+
 /// BGE models want an instruction prefix on the *query* side only (not on
 /// passages/documents) - see the model card for bge-small-en-v1.5.
 const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
@@ -28,11 +37,59 @@ struct State {
     mem: Option<Memvid>,
     path: Option<PathBuf>,
     embedder: Option<LocalTextEmbedder>,
+    /// Present only when the active store is an encrypted `.mv2e` capsule opened via
+    /// `open`'s `passphrase` param. Its presence *is* "encrypted mode" — see
+    /// `EncryptionSession`.
+    #[cfg(feature = "encryption")]
+    encryption: Option<EncryptionSession>,
 }
 
 impl State {
     fn new(embedder: Option<LocalTextEmbedder>) -> Self {
-        State { mem: None, path: None, embedder }
+        State {
+            mem: None,
+            path: None,
+            embedder,
+            #[cfg(feature = "encryption")]
+            encryption: None,
+        }
+    }
+}
+
+/// Bookkeeping for an open encrypted (`.mv2e`) store: the durable encrypted target the
+/// host asked for, the plaintext `.mv2` scratch copy `memvid_core::Memvid` actually reads
+/// and writes, and the passphrase (kept only for the life of the session, to re-`lock_file`
+/// on every `commit` without asking the host again).
+#[cfg(feature = "encryption")]
+struct EncryptionSession {
+    target_path: PathBuf,
+    plaintext_path: PathBuf,
+    passphrase: Vec<u8>,
+}
+
+#[cfg(feature = "encryption")]
+impl Drop for EncryptionSession {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+
+/// Release the active store (if any). In encrypted mode this also best-effort deletes the
+/// plaintext `.mv2` scratch file left in the OS temp dir — a plain `remove_file`, not a
+/// secure wipe, see `docs/memvidd.md` (Encryption) — and zeroizes the held passphrase via
+/// `EncryptionSession`'s `Drop`. Called both by `close` and by `open` before racing our own
+/// still-held exclusive file lock with a new one.
+fn release_active_store(state: &mut State) {
+    state.mem = None;
+    state.path = None;
+    #[cfg(feature = "encryption")]
+    if let Some(session) = state.encryption.take() {
+        if let Err(e) = std::fs::remove_file(&session.plaintext_path) {
+            eprintln!(
+                "[memvidd] warning: failed to remove plaintext temp file {}: {e}",
+                session.plaintext_path.display()
+            );
+        }
     }
 }
 
@@ -139,8 +196,7 @@ fn handle_line(line: &str, state: &mut State) -> String {
         "stats" => op_stats(state),
         "inspect" => op_inspect(&params),
         "close" => {
-            state.mem = None;
-            state.path = None;
+            release_active_store(state);
             Ok(json!({}))
         }
         "" => Err(("missing `method`".to_string(), "BAD_PARAMS")),
@@ -163,12 +219,30 @@ fn op_open(state: &mut State, params: &Value) -> Result<Value, (String, &'static
         .ok_or_else(|| ("`params.path` is required".to_string(), "BAD_PARAMS"))?;
     let want_create = params.get("create").and_then(Value::as_bool).unwrap_or(false);
     let path_buf = PathBuf::from(path);
+    let passphrase = params.get("passphrase").and_then(Value::as_str);
 
     // Release any previously-open store first, otherwise re-opening the same path
     // (or any path) races our own still-held exclusive file lock.
-    state.mem = None;
-    state.path = None;
+    release_active_store(state);
 
+    if let Some(passphrase) = passphrase {
+        #[cfg(feature = "encryption")]
+        {
+            return op_open_encrypted(state, path, path_buf, want_create, passphrase.as_bytes());
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = passphrase;
+            return Err((
+                "this memvidd build was compiled without encryption support; rebuild with \
+                 --features \"vec encryption\" to open a passphrase-protected store"
+                    .to_string(),
+                "ENCRYPTION_NOT_BUILT",
+            ));
+        }
+    }
+
+    // Today's plaintext `.mv2` path — unchanged from before `passphrase` existed.
     let exists = path_buf.exists();
 
     let (mem, created) = if want_create && !exists {
@@ -190,7 +264,102 @@ fn op_open(state: &mut State, params: &Value) -> Result<Value, (String, &'static
     state.mem = Some(mem);
     state.path = Some(path_buf);
 
-    Ok(json!({ "path": path, "documents": documents, "created": created }))
+    Ok(open_result(path, documents, created, false))
+}
+
+/// Build the `open` result. The `encrypted` field only ever appears in builds compiled
+/// with the `encryption` feature — a `--features vec` (no encryption) build's `open`
+/// result is byte-for-byte identical to before `passphrase` existed.
+#[cfg(feature = "encryption")]
+fn open_result(path: &str, documents: u64, created: bool, encrypted: bool) -> Value {
+    json!({ "path": path, "documents": documents, "created": created, "encrypted": encrypted })
+}
+
+#[cfg(not(feature = "encryption"))]
+fn open_result(path: &str, documents: u64, created: bool, _encrypted: bool) -> Value {
+    json!({ "path": path, "documents": documents, "created": created })
+}
+
+/// Encrypted-mode `open`: `path` names the durable `.mv2e` capsule. `memvid-core` cannot
+/// read a capsule directly (`Memvid::open` on `.mv2e` bytes returns `MemvidError::EncryptedFile`
+/// by design), so this unlocks it into a plaintext `.mv2` scratch file in the OS temp dir and
+/// opens *that* — re-locked back over `path` on every `commit` (see `op_commit`) and deleted
+/// on `close`/re-`open` (see `release_active_store`). The scratch file is never left behind on
+/// a failed unlock: `encryption::unlock_file` only creates it after the AEAD tag has verified.
+#[cfg(feature = "encryption")]
+fn op_open_encrypted(
+    state: &mut State,
+    path: &str,
+    target_path: PathBuf,
+    want_create: bool,
+    passphrase: &[u8],
+) -> Result<Value, (String, &'static str)> {
+    let exists = target_path.exists();
+    let plaintext_path = plaintext_temp_path(&target_path);
+
+    let (mem, created) = if want_create && !exists {
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| (format!("cannot create parent dir: {e}"), "IO_ERROR"))?;
+        }
+        let mut m = Memvid::create(&plaintext_path)
+            .map_err(|e| (format!("create failed: {e}"), "IO_ERROR"))?;
+        m.commit().map_err(|e| (format!("initial commit failed: {e}"), "IO_ERROR"))?;
+        // Lock immediately so the durable `.mv2e` exists on disk right after `open`,
+        // same as the plaintext path (`Memvid::create` + `commit` already leaves a
+        // durable `.mv2` on disk) — don't wait for an explicit `commit` call.
+        encryption::lock_file(&plaintext_path, Some(target_path.as_path()), passphrase)
+            .map_err(|e| (format!("initial encryption failed: {e}"), "IO_ERROR"))?;
+        (m, true)
+    } else {
+        encryption::unlock_file(&target_path, Some(plaintext_path.as_path()), passphrase)
+            .map_err(map_unlock_error)?;
+        let m = Memvid::open(&plaintext_path)
+            .map_err(|e| (format!("open failed: {e}"), "IO_ERROR"))?;
+        (m, false)
+    };
+
+    let documents = mem.stats().map(|s| s.frame_count).unwrap_or(0);
+
+    state.mem = Some(mem);
+    state.path = Some(target_path.clone());
+    state.encryption = Some(EncryptionSession {
+        target_path,
+        plaintext_path,
+        passphrase: passphrase.to_vec(),
+    });
+
+    Ok(open_result(path, documents, created, true))
+}
+
+/// A password-derived-key AEAD failure (`EncryptionError::Decryption`) means either a wrong
+/// passphrase or a corrupted capsule — `memvid-core` can't tell the two apart, and neither
+/// message includes the passphrase itself. Mapped to its own `BAD_PASSPHRASE` code so hosts
+/// can distinguish it from a generic I/O failure. Every other `EncryptionError` (bad magic,
+/// unsupported version, truncated file, not-an-mv2-file, ...) stays `IO_ERROR`.
+#[cfg(feature = "encryption")]
+fn map_unlock_error(err: EncryptionError) -> (String, &'static str) {
+    let message = err.to_string();
+    let code = match &err {
+        EncryptionError::Decryption { .. } => "BAD_PASSPHRASE",
+        _ => "IO_ERROR",
+    };
+    (message, code)
+}
+
+/// A fresh, never-colliding path for the plaintext `.mv2` scratch copy of an encrypted store,
+/// in the OS temp dir (not next to the `.mv2e`, so a leftover after an unclean exit doesn't
+/// sit beside — or get mistaken for — the durable capsule).
+#[cfg(feature = "encryption")]
+fn plaintext_temp_path(target_path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = target_path.file_stem().and_then(|s| s.to_str()).unwrap_or("store");
+    std::env::temp_dir().join(format!("memvidd-{}-{stem}-{nanos}-{seq}.mv2", std::process::id()))
 }
 
 fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, &'static str)> {
@@ -366,6 +535,19 @@ fn op_commit(state: &mut State) -> Result<Value, (String, &'static str)> {
         .ok_or_else(|| ("no memory file is open; call `open` first".to_string(), "MV2_NOT_OPEN"))?;
     mem.commit().map_err(|e| (format!("commit failed: {e}"), "IO_ERROR"))?;
     let documents = mem.stats().map(|s| s.frame_count).unwrap_or(0);
+
+    // In encrypted mode the durable `.mv2e` must reflect every commit, not just the state
+    // at `close` — re-lock the plaintext scratch file back over the target now.
+    #[cfg(feature = "encryption")]
+    if let Some(session) = state.encryption.as_ref() {
+        encryption::lock_file(
+            &session.plaintext_path,
+            Some(session.target_path.as_path()),
+            &session.passphrase,
+        )
+        .map_err(|e| (format!("failed to re-encrypt store: {e}"), "IO_ERROR"))?;
+    }
+
     Ok(json!({ "documents": documents }))
 }
 
