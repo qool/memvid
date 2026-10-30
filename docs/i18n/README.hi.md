@@ -141,7 +141,7 @@
 
 ### आवश्यकताएं
 
--   **Rust 1.85.0+** — Install from [rustup.rs](https://rustup.rs)
+-   **Rust 1.88.0+** — Install from [rustup.rs](https://rustup.rs)
 
 ### अपने प्रोजेक्ट में जोड़ें
 

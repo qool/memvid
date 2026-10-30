@@ -21,7 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ed25519 signatures for authenticity
 - Optional AES-256-GCM encryption
 
+### Changed
+- Building now requires Rust 1.88 or newer (was 1.85).
+- PDF text extraction orders some pages differently, so newly ingested PDFs can chunk and rank slightly differently. Existing `.mv2` files are unaffected.
+
 ### Security
+- Ingesting a crafted PDF, DOCX, PPTX, XLSX or XLS file can no longer crash the process or exhaust its memory (RUSTSEC-2026-0187, RUSTSEC-2026-0194, RUSTSEC-2026-0195).
+- Resolved further advisories in dependencies: `bytes`, `crossbeam-epoch`, `lz4_flex`, `memmap2`, `rand`, `time`, `webpki-root-certs` and the build-time `tar`.
 - Embedded WAL prevents data corruption
 - Atomic commits ensure consistency
 - File locking prevents concurrent write conflicts

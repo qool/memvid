@@ -140,7 +140,7 @@ Utilisez Memvid dans votre langage préféré :
 
 ### Prérequis
 
-- **Rust 1.85.0+** — Installer depuis [rustup.rs](https://rustup.rs)
+- **Rust 1.88.0+** — Installer depuis [rustup.rs](https://rustup.rs)
 
 ### Ajouter à votre projet
 

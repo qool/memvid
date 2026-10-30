@@ -141,7 +141,7 @@ Memvid 이동 가능한 서버리스 메모리 레이어로 AI 에이전트에 �
 
 ### 요구 사항
 
--   **Rust 1.85.0+** — [rustup.rs](https://rustup.rs)에서 설치 가능합니다.
+-   **Rust 1.88.0+** — [rustup.rs](https://rustup.rs)에서 설치 가능합니다.
 
 ### 프로젝트에 추가
 

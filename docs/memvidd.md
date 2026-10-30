@@ -30,6 +30,62 @@ Noteworthy upstream changes still NOT adopted (tracked for a future pass): stric
 vector-index/model binding (`80a2544`) — the WAL corruption and stale-`frame_id` fixes were
 already picked up for free by the rebase itself.
 
+## Security dependency bump (2026-10-30)
+
+Upstream has not released a fix. As of 2026-10-30 the newest `memvid-core` on crates.io is
+2.0.140 (2026-05-27), and the `@memvid/sdk`, `memvid-cli` and PyPI `memvid-sdk` 2.0.160 builds
+from the same day embed the same vulnerable parser versions (checked in the SDK's native
+binary). This branch therefore bumps them directly (upstream issue #242; upstream PR #256 covers
+only `lopdf` and `pdf-extract`):
+
+| Crate | Was | Now | Advisory |
+|---|---|---|---|
+| `lopdf` | 0.38 / 0.39 | 0.42 | RUSTSEC-2026-0187: stack overflow on deeply nested PDF objects |
+| `pdf-extract` | 0.10 | 0.12 | pulled in the old `lopdf` |
+| `quick-xml` | 0.30 / 0.31 | 0.41 | RUSTSEC-2026-0194 / -0195: quadratic time, unbounded allocation |
+| `calamine` | 0.22 | 0.36 | pulled in the old `quick-xml` |
+
+The versions were picked so the build tree has one version of each crate. A `quick-xml` 0.31
+remains in `Cargo.lock` only through the optional `pdf_oxide` feature, which memvidd does not
+build. `calamine` 0.36 needs Rust 1.88, so `rust-version` moved from 1.85 to 1.88 (the pinned
+toolchain is still 1.90). The same pass took semver-compatible lockfile patches for `bytes`,
+`crossbeam-epoch`, `lz4_flex`, `memmap2`, `rand`, `time`, `webpki-root-certs` and the build-time
+`tar`, with no code changes.
+
+Code adaptations, all in `src/reader/`:
+
+- quick-xml 0.41 reports every entity reference (`&amp;`, `&#233;`) as a separate
+  `Event::GeneralRef`, and `BytesText::unescape` is gone. The DOCX and PPTX readers now join
+  the pieces of a text node back together before trimming, so `Tom &amp; Jerry` still comes out
+  as `Tom & Jerry`. A unit test in each reader covers this.
+- `trim_text` moved to `reader.config_mut()`. Attribute values use
+  `decoded_and_normalized_value(XmlVersion::Implicit1_0, ...)`, which is what the deprecated
+  `decode_and_unescape_value` delegates to.
+- calamine replaced the `DataType` enum with `Data`, `worksheet_range` returns a `Result`
+  instead of `Option<Result>`, and `DateTime` and `Duration` merged into
+  `DateTime(ExcelDateTime)`. Output is unchanged, because both were already rendered as the
+  same number.
+
+Verified by running the old and the new memvidd on the same inputs. DOCX, PPTX, XLSX and
+`bitcoin.pdf` give identical search hits, and the total frame count is unchanged. The one
+behavioral difference is PDF text extraction in `pdf-extract` 0.12, which orders some page text
+differently, so newly ingested PDFs can chunk and rank slightly differently. Existing `.mv2`
+files are not touched.
+
+Deliberately left for later, because the vulnerable code paths are not reachable from memvidd:
+
+- `zip` 7.2 / 8.6 (fixed in 9.0.5): the advisories concern extracting archives to disk,
+  symlinks, permissions and legacy decoders. memvid only reads entries in memory and builds
+  `zip` with deflate only.
+- `zstd` 0.13 / `zstd-safe` 7.2 (fixed in 0.14 / 8.2): memvid only calls `encode_all` and
+  `decode_all`, none of the affected APIs (seekable, dictionaries, multithreaded contexts).
+- `lru` 0.12 comes from `tantivy` and can only move with it.
+- `bincode`, `paste`, `ttf-parser` and `block-buffer` have advisories without a fixed release,
+  mostly "unmaintained".
+
+When rebasing onto an upstream release that already contains these bumps, prefer upstream's
+`Cargo.toml` versions and drop the ones from this pass.
+
 ## Build
 
 ```bash

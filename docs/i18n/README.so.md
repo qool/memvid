@@ -139,7 +139,7 @@ Ku isticmaal Memvid luuqadda aad doorbidi lahayd:
 
 ### Shuruudaha
 
--   **Rust 1.85.0+** — Si aad ugu shubato Guji linkagan [rustup.rs](https://rustup.rs)
+-   **Rust 1.88.0+** — Si aad ugu shubato Guji linkagan [rustup.rs](https://rustup.rs)
 
 ### Ku dar Mashruucaaga
 

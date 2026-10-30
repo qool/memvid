@@ -141,7 +141,7 @@ Používejte Memvid ve svém preferovaném jazyce:
 
 ### Požadavky
 
--   **Rust 1.85.0+** — Instalace z [rustup.rs](https://rustup.rs)
+-   **Rust 1.88.0+** — Instalace z [rustup.rs](https://rustup.rs)
 
 ### Přidejte do svého projektu
 

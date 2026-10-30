@@ -175,7 +175,7 @@
 
 ### আবশ্যকতা
 
--   **Rust 1.85.0+** — Install from [rustup.rs](https://rustup.rs)
+-   **Rust 1.88.0+** — Install from [rustup.rs](https://rustup.rs)
 
 ### আপনার প্রকল্পে যোগ করুন
 

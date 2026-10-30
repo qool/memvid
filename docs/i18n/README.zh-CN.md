@@ -135,7 +135,7 @@ Memvid 是无服务器便携记忆层，为 AI 智能体提供持久记忆和快
 
 ### 要求
 
--   **Rust 1.85.0+** — 从 [rustup.rs](https://rustup.rs) 安装
+-   **Rust 1.88.0+** — 从 [rustup.rs](https://rustup.rs) 安装
 
 ### 添加到项目
 
