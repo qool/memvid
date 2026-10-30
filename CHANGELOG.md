@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-30
+
 ### Added
 - `memvidd` `add_document` skips a document whose text the store already holds and reports `status`
   (`added` or `unchanged`) and `same_name`.
