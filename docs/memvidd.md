@@ -121,7 +121,7 @@ rather than silently ignored.
 | `open` | `{path, create, passphrase?}` | `{path, documents, created, vector_search, needs_reembed, encrypted?}` - `needs_reembed` marks a store whose vectors come from another embedding model (see **Model binding and re-embedding**); `vector_search` is true when semantic search is on for this store. Closes any previously-open store first (so re-opening the same path is safe), then sets the one active store; `create:true` makes+commits an empty `.mv2` when the file is absent. `passphrase` treats `path` as an encrypted `.mv2e` capsule — see **Encryption** below; `encrypted` is only present in `encryption`-feature builds |
 | `add_document` | `{content?, content_base64?, metadata:{source,...}}` | `{chunks:1, seq}` — exactly one of `content` (plain UTF-8) / `content_base64` (raw file bytes, natively extracted — see **Native document extraction**) is required. `chunks` is always 1 here (one ingest call per document); `memvid-core` may still split the document into several search-indexed frames internally — see **Chunking** below. Every metadata key is stored as a frame tag |
 | `commit` | `{}` | `{documents}` — in encrypted mode, also re-locks the durable `.mv2e` (see **Encryption**) |
-| `search` | `{query, k?}` | `{hits:[{score, content, metadata:{source,uri,frame_id,rank,matches}}], total_hits, elapsed_ms}` |
+| `search` | `{query, k?}` | `{hits:[{score, content, metadata:{source,uri,frame_id,rank,matches,similarity}}], total_hits, elapsed_ms}` - `score` is only `1/rank` of the fused list; `similarity` is the cosine between the query and the hit (`null` without an embedder), see **Cross-memory comparable similarity** |
 | `stats` | `{}` | `{path, documents, vector_search, needs_reembed}` - about the *active* store |
 | `inspect` | `{path}` | `{path, documents: int\|null}` — reads any `.mv2`'s document count via `Memvid::open_read_only` (a shared, not exclusive, lock) without disturbing the active store; `null` (not an error) for anything unreadable |
 | `close` | `{}` | `{}` — drops the active store, process stays up; in encrypted mode, best-effort deletes the plaintext scratch file (see **Encryption**) |
@@ -458,7 +458,24 @@ passage (page 9); lexical-only's #2/#3 were a probability table and a proof-of-w
 plausible, but less directly on-topic. Both returned *something* relevant; hybrid ranked the
 most relevant chunk higher.
 
-### Source diversity (2026-09-15)
+### Cross-memory comparable similarity (2026-10-30)
+
+`score` is `1 / rank` of the fused, diversified list, so it says nothing about how relevant a hit is
+compared with a hit from another memory. Every hit therefore also carries `metadata.similarity`: the
+cosine between the query and the hit's text. All memories are bound to the same embedding model and
+its vectors are L2-normalised, so the cosine is comparable across memories.
+
+- Vector hits: `search_vec` returns an L2 distance `d`; for unit vectors `cos = 1 - d^2 / 2`
+  (`cosine_from_distance`).
+- Lexical-only hits (found by keyword, no vector neighbour): their text is embedded once with the
+  `passage: ` prefix (batched) and compared with the query embedding (`fill_missing_similarity`).
+- A hit found by both sides keeps the similarity the vector side measured.
+
+Measured on the state-budget PDF: a relevant question gives 0.84-0.85 for its top hits, an irrelevant one
+(a recipe) at best 0.79, so the band is narrow (e5 similarities are compressed) but the order is
+meaningful. An exact-term query (an ISBN) found by the lexical side has a *lower* similarity (0.74)
+than semantic neighbours (0.75), which is why a merge across memories must not sort by cosine alone.
+ragtime fuses the global cosine order with each memory's own rank order (`src/merge.ts`).
 
 Raw RRF-by-score alone lets one source dominate every slot: found on real user data (a memory
 mixing one 194-page terms-and-conditions PDF with three one-page e-tickets — every top-5 hit

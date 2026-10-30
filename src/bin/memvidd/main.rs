@@ -118,6 +118,10 @@ struct RankedHit {
     title: Option<String>,
     content: String,
     matches: usize,
+    /// Cosine similarity between the query and this hit's text, `None` without an
+    /// embedder. Every store is bound to the same embedding model and its vectors are
+    /// L2-normalised, so unlike the fused rank this is comparable across memories.
+    similarity: Option<f32>,
 }
 
 fn main() {
@@ -615,13 +619,23 @@ fn op_search(state: &mut State, params: &Value) -> Result<Value, (String, &'stat
     // e-tickets; three people's tickets where two low-value chunks from the
     // same two people crowded out the third person's only relevant chunk).
     let pool_k = (k * 6).max(20);
+    let query_embedding = embedder.and_then(|embedder| match embedder.embed_query(&query) {
+        Ok(embedding) => Some(embedding),
+        Err(err) => {
+            eprintln!("[memvidd] query embedding failed, skipping vector search: {err}");
+            None
+        }
+    });
     let lexical = lexical_hits(mem, &query, pool_k)?;
-    let vector = embedder
-        .map(|embedder| vector_hits(mem, embedder, &query, pool_k))
-        .transpose()?
-        .unwrap_or_default();
+    let vector = match &query_embedding {
+        Some(embedding) => vector_hits(mem, embedding, pool_k)?,
+        None => Vec::new(),
+    };
 
     let mut merged = rrf_merge(lexical, vector, k);
+    if let (Some(embedder), Some(embedding)) = (embedder, &query_embedding) {
+        fill_missing_similarity(&mut merged, embedder, embedding);
+    }
 
     // Both ranked lists can legitimately come back empty only when the corpus
     // itself has nothing close to the query; the lexical degrade tiers already
@@ -647,6 +661,7 @@ fn op_search(state: &mut State, params: &Value) -> Result<Value, (String, &'stat
                     "frame_id": hit.frame_id,
                     "rank": i + 1,
                     "matches": hit.matches,
+                    "similarity": hit.similarity.map(|s| (f64::from(s) * 10_000.0).round() / 10_000.0),
                 },
             })
         })
@@ -663,6 +678,7 @@ fn ranked_hit_from_search_hit(hit: SearchHit) -> RankedHit {
         title: hit.title,
         content: clean_snippet(&raw),
         matches: hit.matches,
+        similarity: None,
     }
 }
 
@@ -713,24 +729,15 @@ fn degrade_lexical(mem: &mut Memvid, query: &str, k: usize) -> Result<Vec<Search
     Ok(hits)
 }
 
-/// Semantic search: embed the query and rank frames by vector distance,
-/// fetching each hit's text/title/uri by id since `search_vec` only returns
-/// `{frame_id, distance}`.
+/// Semantic search: rank frames by vector distance to the (already embedded)
+/// query, fetching each hit's text/title/uri by id since `search_vec` only
+/// returns `{frame_id, distance}`.
 fn vector_hits(
     mem: &mut Memvid,
-    embedder: &E5Embedder,
-    query: &str,
+    query_embedding: &[f32],
     k: usize,
 ) -> Result<Vec<RankedHit>, (String, &'static str)> {
-    let embedding = match embedder.embed_query(query) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("[memvidd] query embedding failed, skipping vector search: {err}");
-            return Ok(Vec::new());
-        }
-    };
-
-    let hits = match mem.search_vec(&embedding, k * 2) {
+    let hits = match mem.search_vec(query_embedding, k * 2) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("[memvidd] vector search failed, skipping: {err}");
@@ -752,10 +759,37 @@ fn vector_hits(
             title: frame.title.clone(),
             content: clean_snippet(&text),
             matches: 0,
+            similarity: Some(cosine_from_distance(hit.distance)),
         });
     }
     ranked.truncate(k);
     Ok(ranked)
+}
+
+/// Cosine similarity from the L2 distance between two unit vectors:
+/// `|a - b|^2 = 2 - 2 cos`, so `cos = 1 - d^2 / 2`.
+fn cosine_from_distance(distance: f32) -> f32 {
+    (1.0 - distance * distance / 2.0).clamp(-1.0, 1.0)
+}
+
+/// Hits found only by the lexical side have no vector distance, so embed their text
+/// and take the cosine to the query, which makes every hit comparable. A failed
+/// embedding just leaves those hits without a similarity.
+fn fill_missing_similarity(hits: &mut [RankedHit], embedder: &E5Embedder, query_embedding: &[f32]) {
+    let missing: Vec<usize> = (0..hits.len()).filter(|&i| hits[i].similarity.is_none()).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let texts: Vec<&str> = missing.iter().map(|&i| hits[i].content.as_str()).collect();
+    match embedder.embed_passages(&texts) {
+        Ok(vectors) => {
+            for (&i, vector) in missing.iter().zip(&vectors) {
+                let dot: f32 = query_embedding.iter().zip(vector).map(|(a, b)| a * b).sum();
+                hits[i].similarity = Some(dot.clamp(-1.0, 1.0));
+            }
+        }
+        Err(err) => eprintln!("[memvidd] could not score lexical-only hits: {err}"),
+    }
 }
 
 /// Reciprocal Rank Fusion: combine two already-ranked hit lists by position
@@ -772,7 +806,18 @@ fn rrf_merge(lexical: Vec<RankedHit>, vector: Vec<RankedHit>, k: usize) -> Vec<R
     }
     for (rank, hit) in vector.into_iter().enumerate() {
         *score.entry(hit.frame_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
-        hit_by_id.entry(hit.frame_id).or_insert(hit);
+        match hit_by_id.entry(hit.frame_id) {
+            // The same frame came from both sides: keep the lexical hit but take the
+            // similarity the vector side measured.
+            std::collections::hash_map::Entry::Occupied(mut found) => {
+                if found.get().similarity.is_none() {
+                    found.get_mut().similarity = hit.similarity;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(hit);
+            }
+        }
     }
 
     let mut ids: Vec<u64> = hit_by_id.keys().copied().collect();
@@ -969,5 +1014,40 @@ mod tests {
     fn plain_words_keep_only_words() {
         assert_eq!(plain_words("galaxie* (Kjóto)? \"pojištění\" -[x]!"), "galaxie Kjóto pojištění x");
         assert_eq!(plain_words("* * *"), "");
+    }
+
+    fn ranked(frame_id: u64, similarity: Option<f32>) -> RankedHit {
+        RankedHit {
+            frame_id,
+            uri: format!("mv2://doc/{frame_id}"),
+            title: None,
+            content: format!("chunk {frame_id}"),
+            matches: 0,
+            similarity,
+        }
+    }
+
+    #[test]
+    fn cosine_from_distance_is_the_cosine_of_two_unit_vectors() {
+        // unit vectors at 60 degrees: cos = 0.5 and L2 distance = sqrt(2 - 2 * 0.5) = 1
+        assert!((cosine_from_distance(1.0) - 0.5).abs() < 1e-6);
+        assert!((cosine_from_distance(0.0) - 1.0).abs() < 1e-6);
+        // orthogonal unit vectors are sqrt(2) apart
+        assert!(cosine_from_distance(2f32.sqrt()).abs() < 1e-6);
+        // rounding noise can't push it outside [-1, 1]
+        assert_eq!(cosine_from_distance(3.0), -1.0);
+    }
+
+    #[test]
+    fn rrf_merge_keeps_the_similarity_the_vector_side_measured() {
+        let lexical = vec![ranked(1, None), ranked(2, None)];
+        let vector = vec![ranked(1, Some(0.8)), ranked(3, Some(0.7))];
+
+        let merged = rrf_merge(lexical, vector, 5);
+
+        let similarity_of = |id: u64| merged.iter().find(|hit| hit.frame_id == id).map(|hit| hit.similarity);
+        assert_eq!(similarity_of(1), Some(Some(0.8)));
+        assert_eq!(similarity_of(2), Some(None));
+        assert_eq!(similarity_of(3), Some(Some(0.7)));
     }
 }
