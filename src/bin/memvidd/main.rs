@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use embed::E5Embedder;
+use memvid_core::types::{FrameRole, FrameStatus};
 use memvid_core::{Memvid, MemvidError, PutOptions, SearchHit, SearchRequest};
 use serde_json::{Value, json};
 
@@ -52,6 +53,8 @@ struct State {
     path: Option<PathBuf>,
     embedder: Option<E5Embedder>,
     vectors: VectorStatus,
+    /// What the active store already holds, built on the first `add_document` after `open`.
+    documents: Option<DocumentIndex>,
     /// Present only when the active store is an encrypted `.mv2e` capsule opened via
     /// `open`'s `passphrase` param. Its presence *is* "encrypted mode" — see
     /// `EncryptionSession`.
@@ -66,6 +69,7 @@ impl State {
             path: None,
             embedder,
             vectors: VectorStatus::Off,
+            documents: None,
             #[cfg(feature = "encryption")]
             encryption: None,
         }
@@ -99,6 +103,7 @@ fn release_active_store(state: &mut State) {
     state.mem = None;
     state.path = None;
     state.vectors = VectorStatus::Off;
+    state.documents = None;
     #[cfg(feature = "encryption")]
     if let Some(session) = state.encryption.take() {
         if let Err(e) = std::fs::remove_file(&session.plaintext_path) {
@@ -428,6 +433,42 @@ fn plaintext_temp_path(target_path: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("memvidd-{}-{stem}-{nanos}-{seq}.mv2", std::process::id()))
 }
 
+/// A fingerprint of a document's text. Trailing whitespace is ignored because memvid-core trims it when
+/// storing, so the text read back from a store hashes like the text that went in.
+fn content_hash(text: &str) -> String {
+    blake3::hash(text.trim_end().as_bytes()).to_hex().to_string()
+}
+
+/// The documents an open store holds: what their text hashes to, and under which names. Used to skip a
+/// document added twice and to notice a new version of a file that is already there. Removal does not
+/// exist, so the index only ever grows.
+#[derive(Default)]
+struct DocumentIndex {
+    hashes: std::collections::HashSet<String>,
+    uris: std::collections::HashSet<String>,
+}
+
+impl DocumentIndex {
+    fn load(mem: &mut Memvid) -> Self {
+        let mut index = DocumentIndex::default();
+        for id in 0..mem.frame_count() as u64 {
+            let Ok(frame) = mem.frame_by_id(id) else {
+                continue;
+            };
+            if frame.role != FrameRole::Document || frame.status != FrameStatus::Active {
+                continue;
+            }
+            if let Some(uri) = &frame.uri {
+                index.uris.insert(uri.clone());
+            }
+            if let Ok(payload) = mem.frame_canonical_payload(id) {
+                index.hashes.insert(content_hash(&String::from_utf8_lossy(&payload)));
+            }
+        }
+        index
+    }
+}
+
 fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, &'static str)> {
     if state.vectors == VectorStatus::Stale {
         return Err((
@@ -450,9 +491,8 @@ fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, 
     // document extraction").
     let content = resolve_content(params, &source)?;
 
-    let mut builder = PutOptions::builder()
-        .title(source.clone())
-        .uri(format!("mv2://doc/{source}"));
+    let uri = format!("mv2://doc/{source}");
+    let mut builder = PutOptions::builder().title(source.clone()).uri(uri.clone());
     if let Some(obj) = metadata.as_object() {
         for (key, value) in obj {
             let v = match value {
@@ -469,11 +509,22 @@ fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, 
         .as_mut()
         .ok_or_else(|| ("no memory file is open; call `open` first".to_string(), "MV2_NOT_OPEN"))?;
 
+    // A document already in the store (same text, whatever its name) is not added again.
+    let hash = content_hash(&content);
+    let index = state.documents.get_or_insert_with(|| DocumentIndex::load(mem));
+    if index.hashes.contains(&hash) {
+        return Ok(json!({ "chunks": 0, "seq": null, "status": "unchanged", "same_name": false }));
+    }
+    // The same name with other text is a new version: memvidd cannot replace, so both are kept.
+    let same_name = index.uris.contains(&uri);
+
     let seq = put_with_best_effort_embedding(mem, embedder, &content, untimed(builder.build()))?;
+    index.hashes.insert(hash);
+    index.uris.insert(uri);
 
     // One `add_document` call per document; memvid-core may still split it into
     // several searchable frames internally (see docs/memvidd.md - Chunking).
-    Ok(json!({ "chunks": 1, "seq": seq }))
+    Ok(json!({ "chunks": 1, "seq": seq, "status": "added", "same_name": same_name }))
 }
 
 /// Resolve `add_document`'s text content, from either `params.content` (plain
@@ -1009,6 +1060,13 @@ fn err_line(id: &Value, message: &str, code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_hash_ignores_trailing_whitespace_only() {
+        assert_eq!(content_hash("a b \n"), content_hash("a b"));
+        assert_ne!(content_hash("a b"), content_hash("a  b"));
+        assert_ne!(content_hash("a"), content_hash("b"));
+    }
 
     #[test]
     fn plain_words_keep_only_words() {

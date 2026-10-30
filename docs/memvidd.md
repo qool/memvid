@@ -119,7 +119,7 @@ rather than silently ignored.
 |---|---|---|
 | `ping` | `{}` | `{pong, version, embeds:"internal"\|"none", embed_model}` - `embed_model` is `"multilingual-e5-base"`, or `null` when running lexical-only |
 | `open` | `{path, create, passphrase?}` | `{path, documents, created, vector_search, needs_reembed, encrypted?}` - `needs_reembed` marks a store whose vectors come from another embedding model (see **Model binding and re-embedding**); `vector_search` is true when semantic search is on for this store. Closes any previously-open store first (so re-opening the same path is safe), then sets the one active store; `create:true` makes+commits an empty `.mv2` when the file is absent. `passphrase` treats `path` as an encrypted `.mv2e` capsule — see **Encryption** below; `encrypted` is only present in `encryption`-feature builds |
-| `add_document` | `{content?, content_base64?, metadata:{source,...}}` | `{chunks:1, seq}` — exactly one of `content` (plain UTF-8) / `content_base64` (raw file bytes, natively extracted — see **Native document extraction**) is required. `chunks` is always 1 here (one ingest call per document); `memvid-core` may still split the document into several search-indexed frames internally — see **Chunking** below. Every metadata key is stored as a frame tag |
+| `add_document` | `{content?, content_base64?, metadata:{source,...}}` | `{chunks:1, seq, status:"added"\|"unchanged", same_name}` — a document whose text is already in the store is not added again (`status:"unchanged"`, `chunks:0`), see **Duplicate documents** — exactly one of `content` (plain UTF-8) / `content_base64` (raw file bytes, natively extracted — see **Native document extraction**) is required. `chunks` is always 1 here (one ingest call per document); `memvid-core` may still split the document into several search-indexed frames internally — see **Chunking** below. Every metadata key is stored as a frame tag |
 | `commit` | `{}` | `{documents}` — in encrypted mode, also re-locks the durable `.mv2e` (see **Encryption**) |
 | `search` | `{query, k?}` | `{hits:[{score, content, metadata:{source,uri,frame_id,rank,matches,similarity}}], total_hits, elapsed_ms}` - `score` is only `1/rank` of the fused list; `similarity` is the cosine between the query and the hit (`null` without an embedder), see **Cross-memory comparable similarity** |
 | `stats` | `{}` | `{path, documents, vector_search, needs_reembed}` - about the *active* store |
@@ -518,6 +518,21 @@ designed. A test that asserted "all 3 profiles must be in the top 3" was checkin
 guarantee than the fix provides; corrected to top-4 (one slot per group). Anyone writing a
 new retrieval-quality check against this fixer should assert **"present within the first N
 slots"** (N = number of distinct sources in the pool), never a tighter window than that.
+
+## Duplicate documents
+
+`add_document` skips a document whose text the store already holds, so adding the same file twice (under
+the same or another name) changes nothing. On the first `add_document` after `open`, memvidd reads every
+active document of the store and keeps two sets: the hash of each text (`content_hash`, BLAKE3 of the text
+without trailing whitespace, which memvid-core trims when storing) and the uri of each (`mv2://doc/<source>`).
+That works for stores made by earlier versions too, since the text is read back from the store.
+
+- identical text: `status:"unchanged"`, nothing is written;
+- the same name with other text: added, `same_name:true`, both versions stay. There is no remove or replace
+  in memvidd on purpose: a document is several frames (the whole text and its chunks) plus vectors and a
+  keyword index, so removal would have to clean all of them, and the answer is to rebuild the memory;
+- the comparison is on extracted text, so a store built before the parser update (2026-10-30), when the text
+  read from a PDF came out a little differently, does not recognise the same PDF as a duplicate.
 
 ## Search strategy
 

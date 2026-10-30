@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `memvidd` `add_document` skips a document whose text the store already holds and reports `status`
+  (`added` or `unchanged`) and `same_name`.
+
+### Added
 - Initial public release of Memvid core library
 - Single-file `.mv2` format for portable AI memory
 - Full-text search with BM25 ranking (Tantivy)
