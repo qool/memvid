@@ -517,6 +517,17 @@ This degrade path now only runs as the fallback when there is no working embedde
 **Hybrid ranking**); with semantic search available, `rrf_merge` compensates for conjunctive
 lexical misses directly.
 
+The query reaches memvid-core as written, so its query language stays available: `"phrases"`,
+`AND`/`OR`/`NOT` (lower case too) with parentheses, and `tag:`, `label:`, `uri:`, `scope:`,
+`track:` and `date:[start TO end]` filters. Two failure modes are handled in `run_query`
+(2026-10-30; before that both failed the whole `search`):
+
+- a query that isn't valid in that language (an unbalanced quote or parenthesis, a lone
+  `* * *`) returns `InvalidQuery`; it is retried as its plain words;
+- when Tantivy finds nothing, or gets a wildcard, memvid-core falls back to a legacy lexical
+  index these stores don't have and returns "Lexical index is not enabled"; that is treated
+  as "no lexical match".
+
 ## Native document extraction
 
 `add_document`'s `content_base64` param routes raw file bytes through `memvid-core`'s built-in
@@ -587,8 +598,8 @@ search hit the same ~1200-char units.
 - The embedding model is the int8 quantization of multilingual-e5-base, slightly below the
   fp32 original in quality; swapping the download URL for `onnx/model.onnx` (1.1 GB) is the
   only change needed to use fp32.
-- A query containing `*` (e.g. `galaxie*` or a pasted `* * *`) fails the whole `search` with
-  memvid-core's misleading "Lexical index is not enabled" (also before 2026-10-30).
+- Wildcards (`galaxie*`) never match lexically: memvid-core only implements them in its legacy
+  lexical index, which these stores don't have. The vector side still answers.
 - `memvid-core` can return the exact same frame twice for one lexical query (observed on a
   chunked PDF); `run_query` over-fetches (`top_k * 2`) and dedupes by `frame_id`.
 - Ingestion cost grows with `vec` on: the 55-page state-budget PDF takes ~5.8s with

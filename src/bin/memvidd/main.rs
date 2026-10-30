@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use embed::E5Embedder;
-use memvid_core::{Memvid, PutOptions, SearchHit, SearchRequest};
+use memvid_core::{Memvid, MemvidError, PutOptions, SearchHit, SearchRequest};
 use serde_json::{Value, json};
 
 #[cfg(feature = "encryption")]
@@ -826,11 +826,42 @@ fn rrf_merge(lexical: Vec<RankedHit>, vector: Vec<RankedHit>, k: usize) -> Vec<R
 
 /// One lexical search pass with the sketch pre-filter disabled.
 ///
+/// The query goes to memvid-core as written, so its query language keeps working
+/// (`"phrases"`, `AND`/`OR`/`NOT`, `tag:`/`label:`/`uri:`/`date:[a TO b]` filters).
+/// A query that isn't valid in that language - an unbalanced quote or parenthesis,
+/// a lone `* * *` - is retried as its plain words instead of failing the search.
+///
 /// `memvid-core` can return the same frame twice for one query (observed on a
 /// chunked PDF: identical frame_id/content pair back to back), so this
 /// over-fetches and dedupes by `frame_id`, keeping the first (best-ranked)
 /// occurrence, before truncating to the requested `k`.
 fn run_query(mem: &mut Memvid, query: &str, k: usize) -> Result<Vec<SearchHit>, (String, &'static str)> {
+    let hits = match lexical_search(mem, query, k) {
+        Err(MemvidError::InvalidQuery { .. }) => {
+            let words = plain_words(query);
+            if words.is_empty() { Ok(Vec::new()) } else { lexical_search(mem, &words, k) }
+        }
+        other => other,
+    };
+    let hits = match hits {
+        Ok(hits) => hits,
+        // When Tantivy finds nothing (or gets a wildcard), memvid-core falls back to a
+        // legacy lexical index these stores don't have and reports "Lexical index is not
+        // enabled": that is "no lexical match", not a failed search.
+        Err(MemvidError::LexNotEnabled) => Vec::new(),
+        Err(e) => return Err((format!("search failed: {e}"), "INTERNAL")),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<SearchHit> = hits
+        .into_iter()
+        .filter(|hit| seen.insert(hit.frame_id))
+        .collect();
+    deduped.truncate(k);
+    Ok(deduped)
+}
+
+fn lexical_search(mem: &mut Memvid, query: &str, k: usize) -> Result<Vec<SearchHit>, MemvidError> {
     let request = SearchRequest {
         query: query.to_string(),
         top_k: k * 2,
@@ -846,18 +877,16 @@ fn run_query(mem: &mut Memvid, query: &str, k: usize) -> Result<Vec<SearchHit>, 
         acl_context: None,
         acl_enforcement_mode: Default::default(),
     };
-    let hits = mem
-        .search(request)
-        .map(|r| r.hits)
-        .map_err(|e| (format!("search failed: {e}"), "INTERNAL"))?;
+    mem.search(request).map(|response| response.hits)
+}
 
-    let mut seen = std::collections::HashSet::new();
-    let mut deduped: Vec<SearchHit> = hits
-        .into_iter()
-        .filter(|hit| seen.insert(hit.frame_id))
-        .collect();
-    deduped.truncate(k);
-    Ok(deduped)
+/// The query reduced to its words, for retrying a query memvid-core can't parse.
+fn plain_words(query: &str) -> String {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn op_stats(state: &State) -> Result<Value, (String, &'static str)> {
@@ -930,4 +959,15 @@ fn clean_snippet(raw: &str) -> String {
 
 fn err_line(id: &Value, message: &str, code: &str) -> String {
     json!({ "id": id, "ok": false, "error": { "message": message, "code": code } }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_words_keep_only_words() {
+        assert_eq!(plain_words("galaxie* (Kjóto)? \"pojištění\" -[x]!"), "galaxie Kjóto pojištění x");
+        assert_eq!(plain_words("* * *"), "");
+    }
 }
