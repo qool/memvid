@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomic commits ensure consistency
 - File locking prevents concurrent write conflicts
 
+## [2.2.0] - 2026-10-30
+
+### Added
+- memvidd search results carry a `similarity` value (cosine to the query) that is comparable between memories, so results from several memories can be ranked together.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added
