@@ -28,7 +28,8 @@ dependencies are gone as a result.
 
 Noteworthy upstream changes still NOT adopted (tracked for a future pass): stricter
 vector-index/model binding (`80a2544`) — the WAL corruption and stale-`frame_id` fixes were
-already picked up for free by the rebase itself.
+already picked up for free by the rebase itself. (Adopted 2026-10-30 together with the
+multilingual model, see **Model binding and re-embedding**.)
 
 ## Security dependency bump (2026-10-30)
 
@@ -93,9 +94,13 @@ cargo build --features vec --bin memvidd            # debug -> target/debug/memv
 cargo build --release --features vec --bin memvidd  # -> target/release/memvidd
 ```
 
-The `[[bin]]` requires the `vec` feature to compile at all (it links
-`memvid_core::text_embed`, which is itself feature-gated) — see **Semantic search** below for
-why that doesn't mean an embedding model is mandatory at runtime.
+The `[[bin]]` requires the `vec` feature to compile at all (it links ONNX Runtime and
+`tokenizers`, which are feature-gated) - see **Semantic search** below for why that doesn't
+mean an embedding model is mandatory at runtime.
+
+The binary lives in `src/bin/memvidd/`: `main.rs` (protocol), `embed.rs` (the embedding
+model), `formats.rs` (file extraction) and `reembed.rs` (the `--reembed` mode, see **Model
+binding and re-embedding**).
 
 `encryption` (`.mv2e` password-based encryption, see **Encryption** below) is an additional
 opt-in feature on top of `vec`, not a replacement for it:
@@ -112,18 +117,20 @@ rather than silently ignored.
 
 | method | params | result |
 |---|---|---|
-| `ping` | `{}` | `{pong, version, embeds:"internal"\|"none"}` |
-| `open` | `{path, create, passphrase?}` | `{path, documents, created, encrypted?}` — closes any previously-open store first (so re-opening the same path is safe), then sets the one active store; `create:true` makes+commits an empty `.mv2` when the file is absent. `passphrase` treats `path` as an encrypted `.mv2e` capsule — see **Encryption** below; `encrypted` is only present in `encryption`-feature builds |
+| `ping` | `{}` | `{pong, version, embeds:"internal"\|"none", embed_model}` - `embed_model` is `"multilingual-e5-base"`, or `null` when running lexical-only |
+| `open` | `{path, create, passphrase?}` | `{path, documents, created, vector_search, needs_reembed, encrypted?}` - `needs_reembed` marks a store whose vectors come from another embedding model (see **Model binding and re-embedding**); `vector_search` is true when semantic search is on for this store. Closes any previously-open store first (so re-opening the same path is safe), then sets the one active store; `create:true` makes+commits an empty `.mv2` when the file is absent. `passphrase` treats `path` as an encrypted `.mv2e` capsule — see **Encryption** below; `encrypted` is only present in `encryption`-feature builds |
 | `add_document` | `{content?, content_base64?, metadata:{source,...}}` | `{chunks:1, seq}` — exactly one of `content` (plain UTF-8) / `content_base64` (raw file bytes, natively extracted — see **Native document extraction**) is required. `chunks` is always 1 here (one ingest call per document); `memvid-core` may still split the document into several search-indexed frames internally — see **Chunking** below. Every metadata key is stored as a frame tag |
 | `commit` | `{}` | `{documents}` — in encrypted mode, also re-locks the durable `.mv2e` (see **Encryption**) |
 | `search` | `{query, k?}` | `{hits:[{score, content, metadata:{source,uri,frame_id,rank,matches}}], total_hits, elapsed_ms}` |
-| `stats` | `{}` | `{path, documents}` — about the *active* store |
+| `stats` | `{}` | `{path, documents, vector_search, needs_reembed}` - about the *active* store |
 | `inspect` | `{path}` | `{path, documents: int\|null}` — reads any `.mv2`'s document count via `Memvid::open_read_only` (a shared, not exclusive, lock) without disturbing the active store; `null` (not an error) for anything unreadable |
 | `close` | `{}` | `{}` — drops the active store, process stays up; in encrypted mode, best-effort deletes the plaintext scratch file (see **Encryption**) |
 
 Errors: `{"id":N,"ok":false,"error":{"message","code"}}` with `code` in
-`BAD_PARAMS | MV2_NOT_OPEN | IO_ERROR | INTERNAL | BAD_PASSPHRASE | ENCRYPTION_NOT_BUILT`. The
-last two only occur when `open` is called with a `passphrase` — see **Encryption**.
+`BAD_PARAMS | MV2_NOT_OPEN | IO_ERROR | INTERNAL | BAD_PASSPHRASE | ENCRYPTION_NOT_BUILT |
+NEEDS_REEMBED`. `BAD_PASSPHRASE` and `ENCRYPTION_NOT_BUILT` only occur when `open` is called
+with a `passphrase` - see **Encryption**. `NEEDS_REEMBED` is `add_document` on a store with
+`needs_reembed: true`.
 
 ## Smoke test
 
@@ -329,57 +336,108 @@ disk.
 Lexical: `Memvid::create` / `Memvid::open` / `commit` / `stats` / `search(SearchRequest)` — the
 same surface as `examples/basic_usage.rs`. Semantic: `preview_chunks` /
 `put_with_embedding_and_options` / `put_with_chunk_embeddings` / `search_vec` /
-`frame_by_id` / `frame_text_by_id`, plus `text_embed::{LocalTextEmbedder, TextEmbedConfig}` and
-the `EmbeddingProvider` trait (`embed_text`, `embed_batch`) — the same surface as
-`examples/text_embedding.rs`.
+`frame_by_id` / `frame_text_by_id`, plus `set_vec_model` / `effective_vec_index_dimension`
+for the model binding. The embedding model itself runs in memvidd (`embed.rs`), not through
+memvid-core's `text_embed`.
 
 ## Semantic search
 
-`memvid-core`'s lexical engine is fast but exact-term-only (see **Search strategy**). Building
-with `--features vec` links ONNX Runtime (`ort`) and a local text-embedding provider
-(`LocalTextEmbedder`), giving true semantic (meaning-based) retrieval on top.
+`memvid-core`'s lexical engine is fast but exact-term-only (see **Search strategy**). memvidd
+adds semantic (meaning-based) retrieval with a local multilingual embedding model:
+`intfloat/multilingual-e5-base` (768 dims, about 100 languages including Czech), as the int8
+ONNX conversion published as `Xenova/multilingual-e5-base`.
 
-**The feature must be compiled in, but the model is a runtime concern**, resolved once at
-startup by `init_embedder()`:
+It runs in memvidd's own `embed.rs` (`E5Embedder`) on ONNX Runtime and `tokenizers` directly.
+memvid-core's `LocalTextEmbedder` can't host it: it only knows a fixed list of English BERT
+models (an unknown name silently falls back to bge-small) and pools the CLS token, while e5
+needs mean pooling over the attention mask and a prefix on every input. Until 2026-10-30
+memvidd used `LocalTextEmbedder` with `bge-small-en-v1.5` (384 dims, English only).
 
-1. Construct `LocalTextEmbedder` with `TextEmbedConfig::default()` (model `bge-small-en-v1.5`,
-   384 dims, cache dir `dirs_next::cache_dir()/memvid/text-models` — `~/Library/Caches/...` on
-   macOS).
-2. Run one real `embed_text()` call as a readiness probe.
-3. If that succeeds: `ping` reports `"embeds":"internal"` and every `add_document`/`search`
-   uses embeddings. If it fails for any reason (model file missing, corrupt ONNX session,
-   etc.): log the reason to stderr and **fall back to lexical-only**, exactly like a non-`vec`
-   build — `ping` reports `"embeds":"none"`.
+**The model is a runtime concern**, resolved once at startup by `init_embedder()`: load the
+model and run one real embedding as a readiness probe. If that works, `ping` reports
+`"embeds":"internal"` and `"embed_model":"multilingual-e5-base"`. If it fails for any reason
+(model file missing, broken ONNX session, ...), memvidd logs why and **falls back to
+lexical-only** (`"embeds":"none"`).
 
-`LocalTextEmbedder` does **not** auto-download the model — `ensure_model_file()` just errors
-with instructions if it's missing. Fetch it once:
+The model is never downloaded automatically. Fetch it once (296 MB; the revision is pinned and
+the hashes are the ones arxcore-v2's Dockerfile checks):
 
 ```bash
-mkdir -p ~/Library/Caches/memvid/text-models   # macOS; ~/.cache/memvid/text-models on Linux
-curl -L 'https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx' \
-  -o ~/Library/Caches/memvid/text-models/bge-small-en-v1.5.onnx
-curl -L 'https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json' \
-  -o ~/Library/Caches/memvid/text-models/bge-small-en-v1.5_tokenizer.json
+D=~/Library/Caches/memvid/text-models   # macOS; ~/.cache/memvid/text-models on Linux
+REV=1ec9243030a27d1a115d5c340572074c125b58b2
+mkdir -p "$D"
+curl -fL "https://huggingface.co/Xenova/multilingual-e5-base/resolve/$REV/onnx/model_quantized.onnx" \
+  -o "$D/multilingual-e5-base.onnx"
+curl -fL "https://huggingface.co/Xenova/multilingual-e5-base/resolve/$REV/tokenizer.json" \
+  -o "$D/multilingual-e5-base_tokenizer.json"
+shasum -a 256 "$D"/multilingual-e5-base*
+# df7a9a29309e3ad491e1783adf8baee710262cc06079c7cbab63c630277fac94  multilingual-e5-base.onnx
+# 62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626  multilingual-e5-base_tokenizer.json
 ```
 
-(~134 MB total.) Without these files the binary still runs fine, just lexical-only.
+Inputs are truncated to 512 tokens. Passages are embedded as `"passage: <text>"` and queries as
+`"query: <text>"`, as the e5 model card requires; the resulting vectors are L2-normalized.
 
 ### Ingestion
 
-`put_with_best_effort_embedding()`: if the document is large enough to chunk
-(`Memvid::preview_chunks`, same ~2400-char threshold as lexical chunking), embed the parent
-text plus every chunk (`embed_batch`) and store them with `put_with_chunk_embeddings` — the
-API `memvid-core` recommends for chunked documents, so each chunk is independently searchable
-by vector, not just the whole document. Otherwise embed the single text and use
+`put_with_best_effort_embedding()`: if memvid-core is going to chunk the document
+(`Memvid::preview_chunks`, ~2400-char threshold), embed the parent text plus every chunk
+(batches of 16) and store them with `put_with_chunk_embeddings`, so each chunk is
+independently searchable by vector. Otherwise embed the single text and use
 `put_with_embedding_and_options`. Any embedding failure degrades that one document to a plain
-lexical `put_bytes_with_options` rather than failing the request.
+lexical put rather than failing the request.
+
+memvidd turns off memvid-core's time-budgeted extraction for every put (`untimed()`). With the
+budget on, memvid-core stored text-like files, judged by the extension in the uri (`.txt`,
+`.md`, `.json`, `.rtf`, `.odt`, ...), as one "skim" frame and left chunking to an enrichment
+worker memvidd never runs. Those documents had a single embedding of their first 512 tokens:
+a 32,000-character story uploaded as `.txt` became 1 frame instead of 23.
 
 ### Query
 
-BGE models want an instruction prefix on the **query** side only (not on stored passages):
-`"Represent this sentence for searching relevant passages: "` (see `BGE_QUERY_PREFIX`).
-`search_vec` only returns `{frame_id, distance}`, so each hit's text/title/uri is fetched with
-`frame_by_id` + `frame_text_by_id`.
+The query is embedded with the `query: ` prefix. `search_vec` only returns
+`{frame_id, distance}`, so each hit's text/title/uri is fetched with `frame_by_id` +
+`frame_text_by_id`.
+
+### Model binding and re-embedding (2026-10-30)
+
+Vectors from two different models must never meet in one index: their similarities are
+meaningless across models. On `open`, `bind_vector_model()` decides per store:
+
+- no vectors yet: bind the store's vector index to `multilingual-e5-base` (memvid-core's
+  `set_vec_model`, persisted in the vector index manifest);
+- 768-d vectors: `set_vec_model` too, and a `ModelMismatch` error marks the store stale;
+- any other dimension: stale. Every store written before 2026-10-30 holds 384-d bge-small
+  vectors and no binding at all.
+
+A stale store answers `open`/`stats` with `needs_reembed: true`, is searched lexical-only
+(including the lexical degrade path), and refuses `add_document` with `NEEDS_REEMBED`, so it
+never ends up half re-indexed.
+
+Stale stores are told apart by dimension, not by binding: memvid-core has no public getter for
+the bound model, and `set_vec_model` binds an unbound index (which `Memvid`'s `Drop` then
+commits, even for `open_read_only`, which opens the file writable). Calling it on a legacy
+store would persist a wrong binding.
+
+`memvidd --reembed <file.mv2>...` rebuilds stale stores and exits:
+
+```bash
+target/release/memvidd --reembed data/memories/*.mv2
+# data/memories/budget.mv2: 1 documents (56 frames) re-embedded with multilingual-e5-base in 5.5s
+```
+
+Per file it reads the active documents (text, uri, title, tags, metadata, timestamp), writes
+them with fresh embeddings into `<file>.reembed-tmp`, verifies the document count and the
+dimension, and renames the result over the original. The original stays locked for the whole
+rebuild (a running ragtime can't write to it meanwhile; memvid-core gives up after ~10 s
+with "file is in use by another process") and is left untouched on any failure. Files already
+bound to the current model are skipped. Superseded and deleted frames are not carried over.
+Encrypted `.mv2e` stores are refused.
+
+The rebuild commits after every document. One commit over a 3-document store with its copied
+metadata failed reproducibly with `Embedded WAL is corrupted ... wal record checksum mismatch`
+(memvid-core has open upstream WAL fixes, PR #231 and #249). Normal ingestion, many documents
+then one commit, was checked against the same real files and was not affected.
 
 ### Hybrid ranking
 
@@ -468,14 +526,29 @@ extracted plain text. All of these readers are unconditionally compiled (`calami
 `pdf-extract` etc. are regular, non-optional dependencies) — no extra cargo feature needed,
 unlike `vec`/`encryption`.
 
-`resolve_content` (in `op_add_document`) picks the reader from `metadata.source`'s file
-extension via `document_format_from_extension` (`.pdf`/`.docx`/`.xlsx`/`.xls`/`.pptx` →
-`DocumentFormat::{Pdf,Docx,Xlsx,Xls,Pptx}`) — **not** from magic-byte sniffing, since the host
-already knows the true filename. `extract_native` then builds a `ReaderHint` with that format,
-finds the matching reader, and calls `.extract()`. The extracted `ReaderOutput.document.text`
-becomes `content` for the rest of the pipeline (chunking, embedding, `put_*`) exactly as if the
-host had sent plain text directly — chunking/embedding code has no idea the text came from a
-reader instead of `params.content`.
+`resolve_content` (in `op_add_document`) picks the extractor from `metadata.source`'s file
+extension via `formats::format_from_extension` - **not** from magic-byte sniffing, since the
+host already knows the true filename. The extracted text becomes `content` for the rest of
+the pipeline (chunking, embedding, `put_*`) exactly as if the host had sent plain text.
+
+| Extensions | Extracted by |
+|---|---|
+| `.pdf` | memvid-core `PdfReader` |
+| `.docx` `.docm` `.dotx` `.dotm` | memvid-core `DocxReader` (macro and template variants share the format) |
+| `.xlsx` `.xlsm` `.xltx` `.xltm` | memvid-core `XlsxReader` |
+| `.xls` | memvid-core `XlsReader` |
+| `.pptx` `.pptm` `.ppsx` `.ppsm` `.potx` `.potm` | memvid-core `PptxReader` |
+| `.ods` `.xlsb` | calamine, rendered like `XlsReader` (`Sheet: <name>`, tab-separated rows) |
+| `.odt` `.odp` | `content.xml` of the archive: one line per paragraph/heading, `Slide N:` per presentation page |
+| `.html` `.htm` `.xhtml` | tag stripper: script/style skipped, blocks on their own lines, table cells tab-separated, HTML5 entities decoded; charset from BOM, `<meta charset>` or XML declaration, else UTF-8, else windows-1250 |
+| `.epub` | `container.xml` -> OPF -> spine order, each chapter through the HTML extractor |
+| `.rtf` | control-word parser: skipped destinations (font/color tables, info, pictures, field instructions), `\'hh` in the `\ansicpgN` code page, `\uN` |
+
+Everything except the memvid-core readers is in `formats.rs`, built only on crates memvid-core
+already depends on (calamine, zip, quick-xml with its `escape-html` feature, encoding_rs), with
+a 64 MiB cap on any single archive entry. Verified on synthetic fixtures (unit tests) and on a
+real 32,000-character Czech story converted to RTF, ODT and HTML by macOS `textutil`: the same
+23-24 frames as the DOCX original and no markup left in search hits.
 
 A reader that finds no text at all (scanned/image-only PDF, a genuinely empty file, or bytes
 that don't decode to anything) fails the whole `add_document` call with `BAD_PARAMS`:
@@ -511,12 +584,16 @@ search hit the same ~1200-char units.
 
 ## Known limitations (PoC)
 
-- Default embedding model (`bge-small-en-v1.5`) is English-tuned; multilingual corpora will
-  see weaker semantic recall than lexical.
+- The embedding model is the int8 quantization of multilingual-e5-base, slightly below the
+  fp32 original in quality; swapping the download URL for `onnx/model.onnx` (1.1 GB) is the
+  only change needed to use fp32.
+- A query containing `*` (e.g. `galaxie*` or a pasted `* * *`) fails the whole `search` with
+  memvid-core's misleading "Lexical index is not enabled" (also before 2026-10-30).
 - `memvid-core` can return the exact same frame twice for one lexical query (observed on a
   chunked PDF); `run_query` over-fetches (`top_k * 2`) and dedupes by `frame_id`.
-- Ingestion cost grows with `vec` on: embedding ~19 chunks of a 22.8k-char PDF took ~2s on
-  Apple Silicon CPU (batched). Fine for a PoC; would want a queue for bulk imports.
+- Ingestion cost grows with `vec` on: the 55-page state-budget PDF takes ~5.8s with
+  multilingual-e5-base on Apple Silicon CPU (4.9s with the old bge-small). Fine for a PoC;
+  would want a queue for bulk imports.
 - One request in flight at a time (the host serialises); no streaming.
 - `.mv2e` encryption is optional and whole-capsule (see **Encryption**) — not per-frame, and
   the plaintext scratch file it operates on is only `remove_file`-deleted on `close`, not

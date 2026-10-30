@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- memvidd semantic search understands Czech and about 100 other languages, including questions asked in one language about documents written in another.
+- memvidd extracts ODT, ODS, ODP, EPUB, RTF and XLSB files, readable text from HTML, and the macro and template variants of Word, Excel and PowerPoint files.
+- `memvidd --reembed <file.mv2>...` rebuilds memories indexed with the previous embedding model.
 - Initial public release of Memvid core library
 - Single-file `.mv2` format for portable AI memory
 - Full-text search with BM25 ranking (Tantivy)
@@ -24,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Building now requires Rust 1.88 or newer (was 1.85).
 - PDF text extraction orders some pages differently, so newly ingested PDFs can chunk and rank slightly differently. Existing `.mv2` files are unaffected.
+- memvidd needs the multilingual-e5-base model files (see `docs/memvidd.md`). Memories indexed with the previous model are searched by keywords only and accept no new documents until they are rebuilt with `memvidd --reembed`.
+
+### Fixed
+- memvidd splits long `.txt`, `.md`, `.json` and other text files into chunks, so semantic search covers the whole file instead of only its beginning.
 
 ### Security
 - Ingesting a crafted PDF, DOCX, PPTX, XLSX or XLS file can no longer crash the process or exhaust its memory (RUSTSEC-2026-0187, RUSTSEC-2026-0194, RUSTSEC-2026-0195).

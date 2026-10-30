@@ -6,17 +6,23 @@
 //!
 //! Build: `cargo build --features vec --bin memvidd` for hybrid lexical + semantic
 //! search (needs a downloaded embedding model, see docs/memvidd.md - Semantic
-//! search). Without `--features vec`, or if the model file is missing, this falls
-//! back to lexical-only search and `ping` reports `"embeds": "none"`.
+//! search). If the model file is missing, this falls back to lexical-only search
+//! and `ping` reports `"embeds": "none"`.
+//!
+//! `memvidd --reembed <file.mv2>...` instead rebuilds stores written with an older
+//! embedding model (see `reembed.rs`) and exits.
+
+mod embed;
+mod formats;
+mod reembed;
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use memvid_core::text_embed::{LocalTextEmbedder, TextEmbedConfig};
-use memvid_core::types::embedding::EmbeddingProvider;
-use memvid_core::{DocumentFormat, Memvid, PutOptions, ReaderHint, ReaderRegistry, SearchHit, SearchRequest};
+use embed::E5Embedder;
+use memvid_core::{Memvid, PutOptions, SearchHit, SearchRequest};
 use serde_json::{Value, json};
 
 #[cfg(feature = "encryption")]
@@ -28,15 +34,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "encryption")]
 use zeroize::Zeroize;
 
-/// BGE models want an instruction prefix on the *query* side only (not on
-/// passages/documents) - see the model card for bge-small-en-v1.5.
-const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
+/// Whether the active store can use this build's embeddings - see `bind_vector_model`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VectorStatus {
+    /// No embedder (model missing) or no store open: lexical-only.
+    Off,
+    /// The store's vector index is bound to this build's model.
+    Ready,
+    /// The store holds vectors from another embedding model. Searching falls back to
+    /// lexical-only and adding documents is refused until `memvidd --reembed` rebuilds it.
+    Stale,
+}
 
 /// Active store, the path it was opened from, and the (optional) embedder.
 struct State {
     mem: Option<Memvid>,
     path: Option<PathBuf>,
-    embedder: Option<LocalTextEmbedder>,
+    embedder: Option<E5Embedder>,
+    vectors: VectorStatus,
     /// Present only when the active store is an encrypted `.mv2e` capsule opened via
     /// `open`'s `passphrase` param. Its presence *is* "encrypted mode" — see
     /// `EncryptionSession`.
@@ -45,11 +60,12 @@ struct State {
 }
 
 impl State {
-    fn new(embedder: Option<LocalTextEmbedder>) -> Self {
+    fn new(embedder: Option<E5Embedder>) -> Self {
         State {
             mem: None,
             path: None,
             embedder,
+            vectors: VectorStatus::Off,
             #[cfg(feature = "encryption")]
             encryption: None,
         }
@@ -82,6 +98,7 @@ impl Drop for EncryptionSession {
 fn release_active_store(state: &mut State) {
     state.mem = None;
     state.path = None;
+    state.vectors = VectorStatus::Off;
     #[cfg(feature = "encryption")]
     if let Some(session) = state.encryption.take() {
         if let Err(e) = std::fs::remove_file(&session.plaintext_path) {
@@ -104,6 +121,16 @@ struct RankedHit {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("--reembed") => std::process::exit(reembed::run(&args[1..], init_embedder().as_ref())),
+        Some(other) => {
+            eprintln!("[memvidd] unknown argument `{other}` (usage: memvidd | memvidd --reembed <file.mv2>...)");
+            std::process::exit(2);
+        }
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let embedder = init_embedder();
@@ -138,28 +165,23 @@ fn main() {
     eprintln!("[memvidd] stdin closed, exiting");
 }
 
-/// Build the local ONNX embedder and probe it with one real embed call, so a
+/// Load the multilingual embedder and probe it with one real embed call, so a
 /// missing model file (or a broken ONNX Runtime) degrades to lexical-only
-/// instead of failing every later request. Cheap when the `vec` feature is
-/// off: `LocalTextEmbedder` still builds, but embedding is never attempted.
-fn init_embedder() -> Option<LocalTextEmbedder> {
-    if !cfg!(feature = "vec") {
-        return None;
-    }
-    let config = TextEmbedConfig::default();
-    let embedder = match LocalTextEmbedder::new(config) {
+/// instead of failing every later request.
+fn init_embedder() -> Option<E5Embedder> {
+    let embedder = match E5Embedder::load() {
         Ok(e) => e,
         Err(err) => {
             eprintln!("[memvidd] embedder init failed, falling back to lexical-only: {err}");
             return None;
         }
     };
-    match embedder.embed_text("ready check") {
+    match embedder.embed_query("ready check") {
         Ok(_) => {
             eprintln!(
                 "[memvidd] semantic search ready ({}, {}d)",
-                embedder.model_info().name,
-                embedder.dimension()
+                embed::MODEL_NAME,
+                embed::DIMENSIONS
             );
             Some(embedder)
         }
@@ -187,7 +209,8 @@ fn handle_line(line: &str, state: &mut State) -> String {
         "ping" => Ok(json!({
             "pong": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "embeds": if state.embedder.is_some() { "internal" } else { "none" }
+            "embeds": if state.embedder.is_some() { "internal" } else { "none" },
+            "embed_model": state.embedder.as_ref().map(|_| embed::MODEL_NAME)
         })),
         "open" => op_open(state, &params),
         "add_document" => op_add_document(state, &params),
@@ -245,7 +268,7 @@ fn op_open(state: &mut State, params: &Value) -> Result<Value, (String, &'static
     // Today's plaintext `.mv2` path — unchanged from before `passphrase` existed.
     let exists = path_buf.exists();
 
-    let (mem, created) = if want_create && !exists {
+    let (mut mem, created) = if want_create && !exists {
         if let Some(parent) = path_buf.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| (format!("cannot create parent dir: {e}"), "IO_ERROR"))?;
@@ -261,23 +284,61 @@ fn op_open(state: &mut State, params: &Value) -> Result<Value, (String, &'static
     };
 
     let documents = mem.stats().map(|s| s.frame_count).unwrap_or(0);
+    state.vectors = bind_vector_model(&mut mem, state.embedder.is_some());
     state.mem = Some(mem);
     state.path = Some(path_buf);
 
-    Ok(open_result(path, documents, created, false))
+    Ok(open_result(path, documents, created, false, state.vectors))
+}
+
+/// Decide whether `mem` can use this build's embeddings, binding its vector index to
+/// `embed::MODEL_NAME` when it can.
+///
+/// Stores written before the multilingual model carry 384-d bge-small vectors and no
+/// binding at all. They are told apart by dimension, not by binding: memvid-core has no
+/// public getter for the bound model, and `set_vec_model` binds an unbound index (which
+/// `Memvid`'s `Drop` then commits), so it must only be called once the dimension already
+/// matches.
+fn bind_vector_model(mem: &mut Memvid, have_embedder: bool) -> VectorStatus {
+    if !have_embedder {
+        return VectorStatus::Off;
+    }
+    match mem.effective_vec_index_dimension() {
+        Ok(Some(dims)) if dims as usize != embed::DIMENSIONS => {
+            eprintln!(
+                "[memvidd] store holds {dims}-d vectors from another embedding model; vector search is off \
+                 until it is rebuilt with `memvidd --reembed`"
+            );
+            VectorStatus::Stale
+        }
+        Ok(_) => match mem.set_vec_model(embed::MODEL_NAME) {
+            Ok(()) => VectorStatus::Ready,
+            Err(err) => {
+                eprintln!("[memvidd] {err}; vector search is off until the store is rebuilt with `memvidd --reembed`");
+                VectorStatus::Stale
+            }
+        },
+        Err(err) => {
+            eprintln!("[memvidd] cannot read the store's vector dimension ({err}); vector search is off");
+            VectorStatus::Stale
+        }
+    }
 }
 
 /// Build the `open` result. The `encrypted` field only ever appears in builds compiled
-/// with the `encryption` feature — a `--features vec` (no encryption) build's `open`
-/// result is byte-for-byte identical to before `passphrase` existed.
-#[cfg(feature = "encryption")]
-fn open_result(path: &str, documents: u64, created: bool, encrypted: bool) -> Value {
-    json!({ "path": path, "documents": documents, "created": created, "encrypted": encrypted })
-}
-
-#[cfg(not(feature = "encryption"))]
-fn open_result(path: &str, documents: u64, created: bool, _encrypted: bool) -> Value {
-    json!({ "path": path, "documents": documents, "created": created })
+/// with the `encryption` feature.
+fn open_result(path: &str, documents: u64, created: bool, encrypted: bool, vectors: VectorStatus) -> Value {
+    let mut result = json!({
+        "path": path,
+        "documents": documents,
+        "created": created,
+        "vector_search": vectors == VectorStatus::Ready,
+        "needs_reembed": vectors == VectorStatus::Stale,
+    });
+    if cfg!(feature = "encryption") {
+        result["encrypted"] = json!(encrypted);
+    }
+    result
 }
 
 /// Encrypted-mode `open`: `path` names the durable `.mv2e` capsule. `memvid-core` cannot
@@ -297,7 +358,7 @@ fn op_open_encrypted(
     let exists = target_path.exists();
     let plaintext_path = plaintext_temp_path(&target_path);
 
-    let (mem, created) = if want_create && !exists {
+    let (mut mem, created) = if want_create && !exists {
         if let Some(parent) = target_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| (format!("cannot create parent dir: {e}"), "IO_ERROR"))?;
@@ -321,6 +382,7 @@ fn op_open_encrypted(
 
     let documents = mem.stats().map(|s| s.frame_count).unwrap_or(0);
 
+    state.vectors = bind_vector_model(&mut mem, state.embedder.is_some());
     state.mem = Some(mem);
     state.path = Some(target_path.clone());
     state.encryption = Some(EncryptionSession {
@@ -329,7 +391,7 @@ fn op_open_encrypted(
         passphrase: passphrase.to_vec(),
     });
 
-    Ok(open_result(path, documents, created, true))
+    Ok(open_result(path, documents, created, true, state.vectors))
 }
 
 /// A password-derived-key AEAD failure (`EncryptionError::Decryption`) means either a wrong
@@ -363,6 +425,14 @@ fn plaintext_temp_path(target_path: &Path) -> PathBuf {
 }
 
 fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, &'static str)> {
+    if state.vectors == VectorStatus::Stale {
+        return Err((
+            "this memory was indexed with an older embedding model; rebuild it with \
+             `memvidd --reembed <file>` before adding documents"
+                .to_string(),
+            "NEEDS_REEMBED",
+        ));
+    }
     let metadata = params.get("metadata").cloned().unwrap_or_else(|| json!({}));
     let source = metadata
         .get("source")
@@ -371,10 +441,9 @@ fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, 
         .to_string();
 
     // Two ways in: plain UTF-8 text (`content`, unchanged since before native
-    // extraction existed), or raw file bytes (`content_base64`) for a binary
-    // format memvid-core's reader registry can extract natively (PDF, DOCX,
-    // XLSX, XLS, PPTX) - see `resolve_content` and docs/memvidd.md "Native
-    // document extraction".
+    // extraction existed), or raw file bytes (`content_base64`) for a format
+    // memvidd can extract itself (see `formats.rs` and docs/memvidd.md "Native
+    // document extraction").
     let content = resolve_content(params, &source)?;
 
     let mut builder = PutOptions::builder()
@@ -390,13 +459,13 @@ fn op_add_document(state: &mut State, params: &Value) -> Result<Value, (String, 
         }
     }
 
-    let embedder = state.embedder.as_ref();
+    let embedder = if state.vectors == VectorStatus::Ready { state.embedder.as_ref() } else { None };
     let mem = state
         .mem
         .as_mut()
         .ok_or_else(|| ("no memory file is open; call `open` first".to_string(), "MV2_NOT_OPEN"))?;
 
-    let seq = put_with_best_effort_embedding(mem, embedder, &content, builder.build())?;
+    let seq = put_with_best_effort_embedding(mem, embedder, &content, untimed(builder.build()))?;
 
     // One `add_document` call per document; memvid-core may still split it into
     // several searchable frames internally (see docs/memvidd.md - Chunking).
@@ -420,55 +489,62 @@ fn resolve_content(params: &Value, source: &str) -> Result<String, (String, &'st
     let bytes = BASE64
         .decode(encoded)
         .map_err(|e| (format!("`content_base64` is not valid base64: {e}"), "BAD_PARAMS"))?;
-    let format = document_format_from_extension(source).ok_or_else(|| {
+    let format = formats::format_from_extension(source).ok_or_else(|| {
         (
             format!("no native reader for the extension on \"{source}\" - send `content` (plain text) instead"),
             "BAD_PARAMS",
         )
     })?;
-    extract_native(&bytes, format, source)
+    formats::extract(&bytes, format, source)
 }
 
-/// Map a filename's extension to the native reader format it needs.
-fn document_format_from_extension(name: &str) -> Option<DocumentFormat> {
-    let ext = name.rsplit('.').next()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "pdf" => Some(DocumentFormat::Pdf),
-        "docx" => Some(DocumentFormat::Docx),
-        "xlsx" => Some(DocumentFormat::Xlsx),
-        "xls" => Some(DocumentFormat::Xls),
-        "pptx" => Some(DocumentFormat::Pptx),
-        _ => None,
-    }
+/// Turn off memvid-core's time-budgeted extraction. `content` is already plain text, but
+/// with a budget memvid-core stores text-like files (judged by the extension in the uri:
+/// `.txt`, `.md`, `.rtf`, `.odt`, ...) as one "skim" frame and leaves chunking to an
+/// enrichment worker memvidd never runs, so only the first 512 tokens got an embedding.
+fn untimed(mut options: PutOptions) -> PutOptions {
+    options.extraction_budget_ms = 0;
+    options
 }
 
-/// The built-in reader set (PDF, DOCX, XLSX, XLS, PPTX, plus a plain-text
-/// fallback) - unconditionally compiled, no extra feature needed (`calamine`,
-/// `pdf-extract` etc. are all regular, non-optional dependencies already).
-fn native_readers() -> &'static ReaderRegistry {
-    static REGISTRY: std::sync::OnceLock<ReaderRegistry> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(ReaderRegistry::default)
+/// Embeddings for one document: the whole text, plus one per chunk when
+/// memvid-core is going to split it (`preview_chunks`, ~2400-char threshold).
+struct DocumentEmbeddings {
+    parent: Vec<f32>,
+    chunks: Vec<Vec<f32>>,
 }
 
-/// Extract plain text from raw file bytes via memvid-core's native reader for
-/// `format`. Returns a `BAD_PARAMS`-coded error (not a crash) when the reader
-/// finds no text at all - e.g. a scanned/image-only PDF, matching the
-/// create-memory-side skip-reason convention on the Node side.
-fn extract_native(bytes: &[u8], format: DocumentFormat, source: &str) -> Result<String, (String, &'static str)> {
-    let hint = ReaderHint::new(None, Some(format));
-    let reader = native_readers()
-        .find_reader(&hint)
-        .ok_or_else(|| (format!("no native reader registered for {source}"), "INTERNAL"))?;
-    let output = reader
-        .extract(bytes, &hint)
-        .map_err(|e| (format!("native extraction of \"{source}\" failed: {e}"), "INTERNAL"))?;
-    match output.document.text {
-        Some(text) if !text.trim().is_empty() => Ok(text),
-        _ => Err((
-            format!("no extractable text in \"{source}\" (scanned/image-only, or genuinely empty)"),
-            "BAD_PARAMS",
-        )),
-    }
+fn embed_document(mem: &Memvid, embedder: &E5Embedder, content: &str) -> Result<DocumentEmbeddings, String> {
+    let parent = embedder
+        .embed_passages(&[content])?
+        .pop()
+        .ok_or_else(|| "the model returned no embedding".to_string())?;
+    let chunks = match mem.preview_chunks(content.as_bytes()) {
+        Some(chunk_texts) => {
+            let refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
+            embedder.embed_passages(&refs)?
+        }
+        None => Vec::new(),
+    };
+    Ok(DocumentEmbeddings { parent, chunks })
+}
+
+/// Store one document, with its embeddings when there are any. Chunked documents
+/// go through `put_with_chunk_embeddings` so every chunk is searchable by vector.
+fn put_document(
+    mem: &mut Memvid,
+    content: &str,
+    embeddings: Option<DocumentEmbeddings>,
+    options: PutOptions,
+) -> Result<u64, (String, &'static str)> {
+    let result = match embeddings {
+        Some(e) if !e.chunks.is_empty() => {
+            mem.put_with_chunk_embeddings(content.as_bytes(), Some(e.parent), e.chunks, options)
+        }
+        Some(e) => mem.put_with_embedding_and_options(content.as_bytes(), e.parent, options),
+        None => mem.put_bytes_with_options(content.as_bytes(), options),
+    };
+    result.map_err(|e| (format!("put failed: {e}"), "INTERNAL"))
 }
 
 /// Ingest one document, embedding it (and its auto-generated chunks) when an
@@ -477,55 +553,18 @@ fn extract_native(bytes: &[u8], format: DocumentFormat, source: &str) -> Result<
 /// embedding model hiccuped.
 fn put_with_best_effort_embedding(
     mem: &mut Memvid,
-    embedder: Option<&LocalTextEmbedder>,
+    embedder: Option<&E5Embedder>,
     content: &str,
     options: PutOptions,
 ) -> Result<u64, (String, &'static str)> {
-    let Some(embedder) = embedder else {
-        return mem
-            .put_bytes_with_options(content.as_bytes(), options)
-            .map_err(|e| (format!("put failed: {e}"), "INTERNAL"));
-    };
-
-    let chunk_plan = mem.preview_chunks(content.as_bytes());
-    let embedded = match chunk_plan {
-        Some(chunk_texts) => {
-            let refs: Vec<&str> = chunk_texts.iter().map(String::as_str).collect();
-            match (embedder.embed_text(content), embedder.embed_batch(&refs)) {
-                (Ok(parent), Ok(chunks)) => Some((Some(parent), chunks)),
-                (parent_result, chunks_result) => {
-                    let reason = parent_result
-                        .err()
-                        .or_else(|| chunks_result.err())
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "unknown error".to_string());
-                    eprintln!(
-                        "[memvidd] chunk embedding failed ({reason}), falling back to lexical-only for this document"
-                    );
-                    None
-                }
-            }
+    let embeddings = embedder.and_then(|embedder| match embed_document(mem, embedder, content) {
+        Ok(embeddings) => Some(embeddings),
+        Err(err) => {
+            eprintln!("[memvidd] embedding failed ({err}), falling back to lexical-only for this document");
+            None
         }
-        None => match embedder.embed_text(content) {
-            Ok(vector) => Some((Some(vector), Vec::new())),
-            Err(err) => {
-                eprintln!("[memvidd] document embedding failed, falling back to lexical-only: {err}");
-                None
-            }
-        },
-    };
-
-    match embedded {
-        Some((parent, chunks)) if !chunks.is_empty() => mem
-            .put_with_chunk_embeddings(content.as_bytes(), parent, chunks, options)
-            .map_err(|e| (format!("put failed: {e}"), "INTERNAL")),
-        Some((Some(parent), _)) => mem
-            .put_with_embedding_and_options(content.as_bytes(), parent, options)
-            .map_err(|e| (format!("put failed: {e}"), "INTERNAL")),
-        _ => mem
-            .put_bytes_with_options(content.as_bytes(), options)
-            .map_err(|e| (format!("put failed: {e}"), "INTERNAL")),
-    }
+    });
+    put_document(mem, content, embeddings, options)
 }
 
 fn op_commit(state: &mut State) -> Result<Value, (String, &'static str)> {
@@ -559,7 +598,7 @@ fn op_search(state: &mut State, params: &Value) -> Result<Value, (String, &'stat
         .to_string();
     let k = params.get("k").and_then(Value::as_u64).unwrap_or(5).max(1) as usize;
 
-    let embedder = state.embedder.as_ref();
+    let embedder = if state.vectors == VectorStatus::Ready { state.embedder.as_ref() } else { None };
     let mem = state
         .mem
         .as_mut()
@@ -674,16 +713,16 @@ fn degrade_lexical(mem: &mut Memvid, query: &str, k: usize) -> Result<Vec<Search
     Ok(hits)
 }
 
-/// Semantic search: embed the query (with the BGE query instruction) and rank
-/// frames by vector distance, fetching each hit's text/title/uri by id since
-/// `search_vec` only returns `{frame_id, distance}`.
+/// Semantic search: embed the query and rank frames by vector distance,
+/// fetching each hit's text/title/uri by id since `search_vec` only returns
+/// `{frame_id, distance}`.
 fn vector_hits(
     mem: &mut Memvid,
-    embedder: &LocalTextEmbedder,
+    embedder: &E5Embedder,
     query: &str,
     k: usize,
 ) -> Result<Vec<RankedHit>, (String, &'static str)> {
-    let embedding = match embedder.embed_text(&format!("{BGE_QUERY_PREFIX}{query}")) {
+    let embedding = match embedder.embed_query(query) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("[memvidd] query embedding failed, skipping vector search: {err}");
@@ -830,7 +869,12 @@ fn op_stats(state: &State) -> Result<Value, (String, &'static str)> {
         Some(mem) => mem.stats().map(|s| s.frame_count).unwrap_or(0),
         None => 0,
     };
-    Ok(json!({ "path": path, "documents": documents }))
+    Ok(json!({
+        "path": path,
+        "documents": documents,
+        "vector_search": state.vectors == VectorStatus::Ready,
+        "needs_reembed": state.vectors == VectorStatus::Stale,
+    }))
 }
 
 /// Read a `.mv2`'s frame count without touching the active store - unlike

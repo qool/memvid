@@ -3192,6 +3192,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs-next",
  "ed25519-dalek",
+ "encoding_rs",
  "extractous",
  "fastrand",
  "fs-err",
